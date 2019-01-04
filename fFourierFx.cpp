@@ -8,6 +8,7 @@
 
 typedef std::complex<double> Complex;
 typedef std::valarray<Complex> CArray;
+typedef std::valarray<float> FArray;
 
 #pragma optimize ("awy", on)
 
@@ -45,7 +46,7 @@ void fft_fast(CArray &x);
 void ifft_fast(CArray& x);
 float parameterValueToFloat(int param, word value);
 int parameterValueToInt(int param, word value);
-void create_window_data(float **window, int length, int windowType, double alpha, double beta, bool unityGain);
+void create_window_data(FArray& window, int length, int windowType, double alpha, double beta, bool unityGain);
 
 ////////////////////////////////////////////////////////////////////////
 // Parameters
@@ -255,10 +256,9 @@ public:
 	float pAlpha, pBeta;
 
 	int inputOffset, outputOffset;
-	CArray data;
-	
-	float *window;
-	float *output;
+	CArray data;	
+	FArray window;
+	FArray output;
 };
 
 DLL_EXPORTS
@@ -278,33 +278,21 @@ mi::mi()
 	debug = new char[16];
 	sprintf(debug, "");
 
-	data = CArray(pBinSize);
-	output = NULL;
-	ReallocBuffers(); // also sets outputOffset = -1
-	
-	window = NULL;
+	ReallocBuffers(); // also sets outputOffset = -1	
 	RecreateWindowFunction(); // also sets inputOffset = 0 
 }
 
 mi::~mi()
 {
 	// Delete allocated memory etc.
-	if (output)
-		delete output;
 	if (debug)
 		delete debug;
-	if (window)
-		delete window;
 }
 
 void mi::MDKInit(CMachineDataInput * const pi)
 {
 	SetOutputMode(true);
 	pCB->SetnumOutputChannels(pCB->GetThisMachine(), 2);
-
-	// Init fields, allocate initial memory
-	//p1 = 0.f;
-	// sampleBuffer = new float[2* bufferSize];
 }
 
 int _numsamples;
@@ -394,7 +382,7 @@ bool mi::MDKWorkStereo(float *psamples, int numsamples, const int mode)
 		{
 			if (mode == WM_READWRITE)
 			{
-				float w = window == NULL ? 1.f : window[inputOffset];
+				float w = window[inputOffset];
 				data[inputOffset] = w * 0.5*(psamples[i * 2] + psamples[(i * 2) + 1]) / 32768.f;
 				inputOffset++;
 				if (inputOffset == pBinSize)
@@ -521,15 +509,13 @@ void mi::ReallocBuffers()
 	data = CArray(pBinSize);
 	inputOffset = 0;
 
-	if (output)
-		delete output;
-	output = new float[pBinSize];
+	output = FArray(pBinSize);
 	outputOffset = -1;
 }
 
 void mi::RecreateWindowFunction()
 {
-	create_window_data(&window, pBinSize, pWindowingFunction, pAlpha, pBeta, true);
+	create_window_data(window, pBinSize, pWindowingFunction, pAlpha, pBeta, false);
 	inputOffset = 0;
 }
 
@@ -694,190 +680,262 @@ double sinc(double x)
 }
 
 // See: http://www.iowahills.com/Example%20Code/WindowedFIRFilterWebCode.txt
-void create_window_data(float **window, int length, int windowType, double alpha, double beta, bool unityGain)
+// These are the various windows definitions. These windows can be used for either
+// FIR filter design or with an FFT for spectral analysis.
+// Sourced verbatim from: ~MyDocs\Code\Common\FFTFunctions.cpp
+// For definitions, see this article:  http://en.wikipedia.org/wiki/Window_function
+
+// This function has 6 inputs
+// Data is the array, of length N, containing the data to to be windowed. 
+// This data is either a FIR filter sinc pulse, or the data to be analyzed by an fft.
+
+// WindowType is an enum defined in the header file, which is at the bottom of this file.
+// e.g. wtKAISER, wtSINC, wtHANNING, wtHAMMING, wtBLACKMAN, ...
+
+// Alpha sets the width of the flat top.
+// Windows such as the Tukey and Trapezoid are defined to have a variably wide flat top.
+// As can be seen by its definition, the Tukey is just a Hanning window with a flat top.
+// Alpha can be used to give any of these windows a partial flat top, except the Flattop and Kaiser.
+// Alpha = 0 gives the original window. (i.e. no flat top)
+// To generate a Tukey window, use a Hanning with 0 < Alpha < 1
+// To generate a Bartlett window (triangular), use a Trapezoid window with Alpha = 0.
+// Alpha = 1 generates a rectangular window in all cases. (except the Flattop and Kaiser)
+
+
+// Beta is used with the Kaiser, Sinc, and Sine windows only.
+// These three windows are primarily used for FIR filter design, not spectral analysis.
+// In FIR filter design, Beta controls the filter's transition bandwidth and the sidelobe levels.
+// The code ignores Beta except in the Kaiser, Sinc, and Sine window cases.
+
+// UnityGain controls whether the gain of these windows is set to unity.
+// Only the Flattop window has unity gain by design. The Hanning window, for example, has a gain
+// of 1/2.  UnityGain = true will set the gain of all these windows to 1.
+// Then, when the window is applied to a signal, the signal's energy content is preserved.
+// Don't use this with FIR filter design however. Since most of the enegy in an FIR sinc pulse
+// is in the middle of the window, the window needs a peak amplitude of one, not unity gain.
+// Setting UnityGain = true will simply cause the resulting FIR filter to have excess gain.
+
+// If using these windows for FIR filters, start with the Kaiser, Sinc, or Sine windows and
+// adjust Beta for the desired transition BW and sidelobe levels (set Alpha = 0).
+// While the FlatTop is an excellent window for spectral analysis, don't use it for FIR filter design.
+// It has a peak amplitude of ~ 4.7 which causes the resulting FIR filter to have about this much gain.
+// It works poorly for FIR filters even if you adjust its peak amplitude.
+// The Trapezoid also works poorly for FIR filter design.
+
+// If using these windows with an fft for spectral analysis, start with the Hanning, Gauss, or Flattop.
+// When choosing a window for spectral analysis, you must trade off between resolution and amplitude accuracy.
+// The Hanning has the best resolution while the Flatop has the best amplitude accuracy.
+// The Gauss is midway between these two for both accuracy and resolution.
+// These three were the only windows available in the HP 89410A Vector Signal Analyzer. Which is to say,
+// unless you have specific windowing requirements, use one of these 3 for general purpose signal analysis.
+// Set UnityGain = true when using any of these windows for spectral analysis to preserve the signal's enegy level.
+void create_window_data(FArray& window, int length, int windowType, double alpha, double beta, bool unityGain)
 {
-	if (*window)
-		delete *window;
-
-	*window = NULL;
-
-	if (windowType == WINDOWFN_SQUARE) return;
-
 	int j, M, TopWidth;
 	double dM;
 
-	if (windowType == WINDOWFN_KAISER_BESSEL|| windowType == WINDOWFN_FLAT_TOP) alpha = 0.0;
-
-	if (alpha < 0.0)alpha = 0.0;
-	if (alpha > 1.0)alpha = 1.0;
-
-	if (beta < 0.0)beta = 0.0;
-	if (beta > 10.0)beta = 10.0;
-
-	*window = new float[length + 2];
-
-	TopWidth = (int)(alpha * (double)length);
-	if (TopWidth % 2 != 0)TopWidth++;
-	if (TopWidth > length)TopWidth = length;
-	M = length - TopWidth;
-	dM = M + 1;
-
-
-	// Calculate the window for length/2 points, then fold the window over (at the bottom).
-	// TopWidth points will be set to 1.
-	if (windowType == WINDOWFN_KAISER)
+	if (windowType != WINDOWFN_SQUARE)
 	{
-		double Arg;
-		for (j = 0; j<M; j++)
+		if (windowType == WINDOWFN_KAISER_BESSEL || windowType == WINDOWFN_FLAT_TOP) alpha = 0.0;
+
+		if (alpha < 0.0)alpha = 0.0;
+		if (alpha > 1.0)alpha = 1.0;
+
+		if (beta < 0.0)beta = 0.0;
+		if (beta > 10.0)beta = 10.0;
+
+		window = FArray(length + 2);
+
+		TopWidth = (int)(alpha * (double)length);
+		if (TopWidth % 2 != 0)TopWidth++;
+		if (TopWidth > length)TopWidth = length;
+		M = length - TopWidth;
+		dM = M + 1;
+
+
+		// Calculate the window for length/2 points, then fold the window over (at the bottom).
+		// TopWidth points will be set to 1.
+		if (windowType == WINDOWFN_KAISER)
 		{
-			Arg = beta * sqrt(1.0 - pow(((double)(2 * j + 2) - dM) / dM, 2.0));
-			(*window)[j] = bessel(Arg) / bessel(beta);
+			double Arg;
+			for (j = 0; j < M; j++)
+			{
+				Arg = beta * sqrt(1.0 - pow(((double)(2 * j + 2) - dM) / dM, 2.0));
+				window[j] = bessel(Arg) / bessel(beta);
+			}
+		}
+
+		else if (windowType == WINDOWFN_SINC)  // Lanczos
+		{
+			for (j = 0; j < M; j++)window[j] = sinc((double)(2 * j + 1 - M) / dM * M_PI);
+			for (j = 0; j < M; j++)window[j] = pow(window[j], beta);
+		}
+
+		else if (windowType == WINDOWFN_SINE)  // Hanning if beta = 2
+		{
+			for (j = 0; j < M / 2; j++)window[j] = sin((double)(j + 1) * M_PI / dM);
+			for (j = 0; j < M / 2; j++)window[j] = pow(window[j], beta);
+		}
+
+		else if (windowType == WINDOWFN_HANN)
+		{
+			for (j = 0; j < M / 2; j++)window[j] = 0.5 - 0.5 * cos((double)(j + 1) * M_2PI / dM);
+		}
+
+		else if (windowType == WINDOWFN_HAMMING)
+		{
+			for (j = 0; j < M / 2; j++)
+				window[j] = 0.54 - 0.46 * cos((double)(j + 1) * M_2PI / dM);
+		}
+
+		else if (windowType == WINDOWFN_BLACKMAN)
+		{
+			for (j = 0; j < M / 2; j++)
+			{
+				window[j] = 0.42
+					- 0.50 * cos((double)(j + 1) * M_2PI / dM)
+					+ 0.08 * cos((double)(j + 1) * M_2PI * 2.0 / dM);
+			}
+		}
+
+
+		// See: http://www.bth.se/fou/forskinfo.nsf/0/130c0940c5e7ffcdc1256f7f0065ac60/$file/ICOTA_2004_ttr_icl_mdh.pdf
+		else if (windowType == WINDOWFN_FLAT_TOP)
+		{
+			for (j = 0; j <= M / 2; j++)
+			{
+				window[j] = 1.0
+					- 1.93293488969227 * cos((double)(j + 1) * M_2PI / dM)
+					+ 1.28349769674027 * cos((double)(j + 1) * M_2PI * 2.0 / dM)
+					- 0.38130801681619 * cos((double)(j + 1) * M_2PI * 3.0 / dM)
+					+ 0.02929730258511 * cos((double)(j + 1) * M_2PI * 4.0 / dM);
+			}
+		}
+
+
+		else if (windowType == WINDOWFN_BLACKMAN_HARRIS)
+		{
+			for (j = 0; j < M / 2; j++)
+			{
+				window[j] = 0.35875
+					- 0.48829 * cos((double)(j + 1) * M_2PI / dM)
+					+ 0.14128 * cos((double)(j + 1) * M_2PI * 2.0 / dM)
+					- 0.01168 * cos((double)(j + 1) * M_2PI * 3.0 / dM);
+			}
+		}
+
+		else if (windowType == WINDOWFN_BLACKMAN_NUTTALL)
+		{
+			for (j = 0; j < M / 2; j++)
+			{
+				window[j] = 0.3535819
+					- 0.4891775 * cos((double)(j + 1) * M_2PI / dM)
+					+ 0.1365995 * cos((double)(j + 1) * M_2PI * 2.0 / dM)
+					- 0.0106411 * cos((double)(j + 1) * M_2PI * 3.0 / dM);
+			}
+		}
+
+		else if (windowType == WINDOWFN_NUTTALL)
+		{
+			for (j = 0; j < M / 2; j++)
+			{
+				window[j] = 0.355768
+					- 0.487396 * cos((double)(j + 1) * M_2PI / dM)
+					+ 0.144232 * cos((double)(j + 1) * M_2PI * 2.0 / dM)
+					- 0.012604 * cos((double)(j + 1) * M_2PI * 3.0 / dM);
+			}
+		}
+
+		else if (windowType == WINDOWFN_KAISER_BESSEL)
+		{
+			for (j = 0; j <= M / 2; j++)
+			{
+				window[j] = 0.402
+					- 0.498 * cos(M_2PI * (double)(j + 1) / dM)
+					+ 0.098 * cos(2.0 * M_2PI * (double)(j + 1) / dM)
+					+ 0.001 * cos(3.0 * M_2PI * (double)(j + 1) / dM);
+			}
+		}
+
+		else if (windowType == WINDOWFN_TRAPEZOID) // Rectangle for alpha = 1  Triangle for alpha = 0
+		{
+			int K = M / 2;
+			if (M % 2)K++;
+			for (j = 0; j < K; j++)window[j] = (double)(j + 1) / (double)K;
+		}
+
+
+		// This definition is from http://en.wikipedia.org/wiki/Window_function (Gauss Generalized normal window)
+		// We set their p = 2, and use alpha in the numerator, instead of Sigma in the denominator, as most others do.
+		// alpha = 2.718 puts the Gauss window response midway between the Hanning and the Flattop (basically what we want).
+		// It also gives the same BW as the Gauss window used in the HP 89410A Vector Signal Analyzer.
+		// alpha = 1.8 puts it quite close to the Hanning.
+		else if (windowType == WINDOWFN_GAUSS)
+		{
+			for (j = 0; j < M / 2; j++)
+			{
+				window[j] = ((double)(j + 1) - dM / 2.0) / (dM / 2.0) * 2.7183;
+				window[j] *= window[j];
+				window[j] = exp(-window[j]);
+			}
+		}
+
+		else // Error.
+		{
+			windowType == WINDOWFN_SQUARE;
 		}
 	}
 
-	else if (windowType == WINDOWFN_SINC)  // Lanczos
+	if (windowType != WINDOWFN_SQUARE)
 	{
-		for (j = 0; j<M; j++)(*window)[j] = sinc((double)(2 * j + 1 - M) / dM * M_PI);
-		for (j = 0; j<M; j++)(*window)[j] = pow((*window)[j], beta);
-	}
-
-	else if (windowType == WINDOWFN_SINE)  // Hanning if beta = 2
-	{
-		for (j = 0; j<M / 2; j++)(*window)[j] = sin((double)(j + 1) * M_PI / dM);
-		for (j = 0; j<M / 2; j++)(*window)[j] = pow((*window)[j], beta);
-	}
-
-	else if (windowType == WINDOWFN_HANN)
-	{
-		for (j = 0; j<M / 2; j++)(*window)[j] = 0.5 - 0.5 * cos((double)(j + 1) * M_2PI / dM);
-	}
-
-	else if (windowType == WINDOWFN_HAMMING)
-	{
+		// Fold the coefficients over.
 		for (j = 0; j<M / 2; j++)
-			(*window)[j] = 0.54 - 0.46 * cos((double)(j + 1) * M_2PI / dM);
-	}
+			window[length - j - 1] = window[j];
 
-	else if (windowType == WINDOWFN_BLACKMAN)
-	{
-		for (j = 0; j<M / 2; j++)
+		// This is the flat top if alpha > 0. Cannot be applied to a Kaiser or Flat Top.
+		if (windowType != WINDOWFN_KAISER &&  windowType != WINDOWFN_FLAT_TOP)
 		{
-			(*window)[j] = 0.42
-				- 0.50 * cos((double)(j + 1) * M_2PI / dM)
-				+ 0.08 * cos((double)(j + 1) * M_2PI * 2.0 / dM);
+			for (j = M / 2; j<length - M / 2; j++)window[j] = 1.0;
+		}
+
+		// This will set the gain of the window to 1. Only the Flattop window has unity gain by design. 
+		if (unityGain)
+		{
+			double Sum = 0.0;
+			for (j = 0; j<length; j++)Sum += window[j];
+			Sum /= (double)length;
+			if (Sum != 0.0)for (j = 0; j<length; j++)window[j] /= Sum;
 		}
 	}
-
-
-	// See: http://www.bth.se/fou/forskinfo.nsf/0/130c0940c5e7ffcdc1256f7f0065ac60/$file/ICOTA_2004_ttr_icl_mdh.pdf
-	else if (windowType == WINDOWFN_FLAT_TOP)
+	else
 	{
-		for (j = 0; j <= M / 2; j++)
+		window = FArray(length);
+		for (j = 0; j < length; j++)
 		{
-			(*window)[j] = 1.0
-				- 1.93293488969227 * cos((double)(j + 1) * M_2PI / dM)
-				+ 1.28349769674027 * cos((double)(j + 1) * M_2PI * 2.0 / dM)
-				- 0.38130801681619 * cos((double)(j + 1) * M_2PI * 3.0 / dM)
-				+ 0.02929730258511 * cos((double)(j + 1) * M_2PI * 4.0 / dM);
+			window[j] = 1.f;
 		}
-	}
-
-
-	else if (windowType == WINDOWFN_BLACKMAN_HARRIS)
-	{
-		for (j = 0; j<M / 2; j++)
-		{
-			(*window)[j] = 0.35875
-				- 0.48829 * cos((double)(j + 1) * M_2PI / dM)
-				+ 0.14128 * cos((double)(j + 1) * M_2PI * 2.0 / dM)
-				- 0.01168 * cos((double)(j + 1) * M_2PI * 3.0 / dM);
-		}
-	}
-
-	else if (windowType == WINDOWFN_BLACKMAN_NUTTALL)
-	{
-		for (j = 0; j<M / 2; j++)
-		{
-			(*window)[j] = 0.3535819
-				- 0.4891775 * cos((double)(j + 1) * M_2PI / dM)
-				+ 0.1365995 * cos((double)(j + 1) * M_2PI * 2.0 / dM)
-				- 0.0106411 * cos((double)(j + 1) * M_2PI * 3.0 / dM);
-		}
-	}
-
-	else if (windowType == WINDOWFN_NUTTALL)
-	{
-		for (j = 0; j<M / 2; j++)
-		{
-			(*window)[j] = 0.355768
-				- 0.487396 * cos((double)(j + 1) * M_2PI / dM)
-				+ 0.144232 * cos((double)(j + 1) * M_2PI * 2.0 / dM)
-				- 0.012604 * cos((double)(j + 1) * M_2PI * 3.0 / dM);
-		}
-	}
-
-	else if (windowType == WINDOWFN_KAISER_BESSEL)
-	{
-		for (j = 0; j <= M / 2; j++)
-		{
-			(*window)[j] = 0.402
-				- 0.498 * cos(M_2PI * (double)(j + 1) / dM)
-				+ 0.098 * cos(2.0 * M_2PI * (double)(j + 1) / dM)
-				+ 0.001 * cos(3.0 * M_2PI * (double)(j + 1) / dM);
-		}
-	}
-
-	else if (windowType == WINDOWFN_TRAPEZOID) // Rectangle for alpha = 1  Triangle for alpha = 0
-	{
-		int K = M / 2;
-		if (M % 2)K++;
-		for (j = 0; j<K; j++)(*window)[j] = (double)(j + 1) / (double)K;
-	}
-
-
-	// This definition is from http://en.wikipedia.org/wiki/Window_function (Gauss Generalized normal window)
-	// We set their p = 2, and use alpha in the numerator, instead of Sigma in the denominator, as most others do.
-	// alpha = 2.718 puts the Gauss window response midway between the Hanning and the Flattop (basically what we want).
-	// It also gives the same BW as the Gauss window used in the HP 89410A Vector Signal Analyzer.
-	// alpha = 1.8 puts it quite close to the Hanning.
-	else if (windowType == WINDOWFN_GAUSS)
-	{
-		for (j = 0; j<M / 2; j++)
-		{
-			(*window)[j] = ((double)(j + 1) - dM / 2.0) / (dM / 2.0) * 2.7183;
-			(*window)[j] *= (*window)[j];
-			(*window)[j] = exp(-(*window)[j]);
-		}
-	}
-
-	else // Error.
-	{
-		if (*window)
-			delete *window;
-		*window = NULL;
-		return;
-	}
-
-	// Fold the coefficients over.
-	for (j = 0; j<M / 2; j++)(*window)[length - j - 1] = (*window)[j];
-
-	// This is the flat top if alpha > 0. Cannot be applied to a Kaiser or Flat Top.
-	if (windowType != WINDOWFN_KAISER &&  windowType != WINDOWFN_FLAT_TOP)
-	{
-		for (j = M / 2; j<length - M / 2; j++)(*window)[j] = 1.0;
-	}
-
-	// This will set the gain of the window to 1. Only the Flattop window has unity gain by design. 
-	if (unityGain)
-	{
-		double Sum = 0.0;
-		for (j = 0; j<length; j++)Sum += (*window)[j];
-		Sum /= (double)length;
-		if (Sum != 0.0)for (j = 0; j<length; j++)(*window)[j] /= Sum;
 	}
 }
 
-//int main()
+
+//Start with taking the iFFT of S(1) and S(2).Let's call the results m(1) and m(2), since they are modified. They are back in the time domain and you wish to recombine them into one signal again. Ideally, they would line up perfectly and you could just truncate one and keep the other. This won't happen, so the trick is to fade the latter into the former over the overlap region.At the beginning of the region the weighting of m(1) should be one and the weighting of m(2) should be zero.At the end of the region, the reverse should be true.The simplest solution is a linear transition, but that may not be the best.
+//
+//For a 50 % overlap, there is a nice property of a VonHann window in that the appropriate weighting is implicitely correct in the transition region and you can simply sum the two modified signals over the overlap region.For other overlap sizes the same function can still be used, but it needs to be resized appropriately.The window function can be applied in the time domain before you take the initial FFT, or after the iFFT is done.Of course, which you do greatly affects the bin values, so it depends on the nature of your "touching" on which way is better.The equivalent of a VonHann window can also be done in the frequency domain by calculating a new value for each bin by subtracting the average value of its neighbors and taking half that value.The equation would be Y[k] = ?.25?X[k?1] + .5?X[k]?.25?X[k + 1] where the Xs are the original bin values.Doing this before or after your "touching" is the same as if you were windowing the signal before going into the frequency domain or after coming out.
+//
+//The less touching you do, the more similar the two modified signals are going to be so the smoother the fading transition.For too much touching, the mismatch between the two modified signals may be too great and the results won't be so good. However, with a fading over the overlap region, the results are always going to be a smooth signal.
+//
+//The VonHann window is good for spectrogram displays because it spreads the value of a sharp peak(near integer frequencies) to the neighboring bins and reduces the leakage of in between frequencies, so when you do a tone sweep through the frequency range, the display remains somewhat consistent and less frame size dependent.Chances are that this same property will make it desirable for you to do the window function before you do your touching.
+//
+//Hope this helps,
+void overlap()
+{
+
+}
+
+
+
+
+//int test_fft()
 //{
 //	const Complex test[] = { 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0 };
 //	CArray data(test, 8);

@@ -1,4 +1,6 @@
 #include <windows.h>
+#include <fstream>
+#include <iostream>
 #include "mdk/mdk.h"
 #include "math.h"
 
@@ -39,6 +41,9 @@ typedef std::valarray<float> FArray;
 #define WINDOWFN_TRAPEZOID 11
 #define WINDOWFN_SINC 12
 #define WINDOWFN_SINE 13
+
+#define OVERLAPCURVE_EXPONENTIAL 0
+#define OVERLAPCURVE_LINEAR 1
 
 void fft(CArray& x);
 void ifft(CArray& x);
@@ -142,8 +147,37 @@ CMachineParameter const paramBeta =
 	PARAM_BETA_DEFAULT          // the default slider value
 };
 
+#define PARAM_OVERLAP_IDX 6
+#define PARAM_OVERLAP_NONE 0xFFFF
+#define PARAM_OVERLAP_DEFAULT 0
+CMachineParameter const paramOverlap =
+{
+	pt_word,                    // Parameter data type
+	"Overlap",                  // Parameter name as its shown in the parameter window
+	"FFT windowing overlap",    // Parameter description as its shown in the pattern view's statusbar
+	0,                          // Minimum value
+	500,                        // Maximum value
+	PARAM_OVERLAP_NONE,         // Novalue, this value means "nothing happened" in the mi::Tick procedure
+	MPF_STATE,                  // Parameter options, MPF_STATE makes it appears as a slider
+	PARAM_OVERLAP_DEFAULT       // the default slider value
+};
 
-#define PARAM_DEBUG_IDX 6
+#define PARAM_OVERLAPCURVE_IDX 7
+#define PARAM_OVERLAPCURVE_NONE 0xFF
+#define PARAM_OVERLAPCURVE_DEFAULT 0
+CMachineParameter const paramOverlapCurve =
+{
+	pt_byte,                        // Parameter data type
+	"OverlapCurve",                 // Parameter name as its shown in the parameter window
+	"FFT windowing overlap curve",  // Parameter description as its shown in the pattern view's statusbar
+	0,                              // Minimum value
+	OVERLAPCURVE_LINEAR,            // Maximum value
+	PARAM_OVERLAPCURVE_NONE,        // Novalue, this value means "nothing happened" in the mi::Tick procedure
+	MPF_STATE,                      // Parameter options, MPF_STATE makes it appears as a slider
+	PARAM_OVERLAPCURVE_DEFAULT      // the default slider value
+};
+
+#define PARAM_DEBUG_IDX 8
 CMachineParameter const paramDebug =
 {
 	pt_byte,                    // Parameter data type
@@ -163,6 +197,8 @@ CMachineParameter const *pParameters[] = {
 	&paramWindowingFunction,
 	&paramAlpha,
 	&paramBeta,
+	&paramOverlap,
+	&paramOverlapCurve,
 	&paramDebug
 };
 
@@ -179,6 +215,8 @@ public:
 	byte paramWindowingFunction;
 	word paramAlpha;
 	word paramBeta;
+	word paramOverlap;
+	byte paramOverlapCurve;
 	byte paramDebug;
 };
 
@@ -244,21 +282,34 @@ public:
 
 	void Process(CArray& x);
 	void ReallocBuffers();
-	void RecreateWindowFunction();
+	void CalculateWindowFunction();
+	void CalculateOverlapFunction();
+	void ResetOffsets();
+	int GetFirstCountDown();
+	int GetOverlapSize();
+	int GetNextCountDown();
+	void CreateOverlapData(FArray& overlapFunction, int length, int overlapType);
 public:
 	miex ex;
 	gvals gval;
 
 	char *debug;
+	std::ofstream *debugfile;
+
 	byte pFloorEnabled, p2Enabled;
 	float pFloor, p2;
-	int pBinSize, pWindowingFunction;
-	float pAlpha, pBeta;
+	int pBinSize, pWindowingFunction, pOverlapCurve;
+	float pAlpha, pBeta, pOverlap;
 
-	int inputOffset, outputOffset;
-	CArray data;	
+	int overlapSize;
+	int data1Offset, data2Offset, output1Offset, output2Offset;
+	int data1CountDown, data2CountDown;
+	CArray data1;
+	CArray data2;
 	FArray window;
-	FArray output;
+	FArray output1;
+	FArray output2;
+	FArray overlapCurve;
 };
 
 DLL_EXPORTS
@@ -268,18 +319,23 @@ mi::mi()
 	GlobalVals = &gval;
 	ex.pmi = this;
 
+	debugfile = new std::ofstream("c:\\temp\\fourier_debug.txt", std::ios::out);
+
 	pFloorEnabled = false;
 	p2Enabled = false;
 	pBinSize = parameterValueToInt(PARAM_BINSIZE_IDX, PARAM_BINSIZE_DEFAULT);
 	pWindowingFunction = parameterValueToInt(PARAM_WINDOWFN_IDX, PARAM_WINDOWFN_DEFAULT);
 	pAlpha = parameterValueToInt(PARAM_ALPHA_IDX, PARAM_ALPHA_DEFAULT);
 	pBeta = parameterValueToInt(PARAM_BETA_IDX, PARAM_BETA_DEFAULT);
+	
+	overlapSize = 0;
 
 	debug = new char[16];
 	sprintf(debug, "");
 
 	ReallocBuffers(); // also sets outputOffset = -1	
-	RecreateWindowFunction(); // also sets inputOffset = 0 
+	CalculateWindowFunction(); // also sets data1Offset = 0 
+
 }
 
 mi::~mi()
@@ -287,6 +343,12 @@ mi::~mi()
 	// Delete allocated memory etc.
 	if (debug)
 		delete debug;
+
+	if (debugfile)
+	{
+		debugfile->close();
+		delete debugfile;
+	}
 }
 
 void mi::MDKInit(CMachineDataInput * const pi)
@@ -309,6 +371,8 @@ float parameterValueToFloat(int param, word value)
 		return value / 1000.f;
 	case PARAM_BETA_IDX:
 		return value / 1000.f;
+	case PARAM_OVERLAP_IDX:
+		return value / 10.f;
 	default:
 		return (float)value;
 	}
@@ -352,8 +416,23 @@ void mi::Tick()
 	{
 		pBeta = parameterValueToFloat(PARAM_BETA_IDX, gval.paramBeta);
 	}
-	
+	if (gval.paramOverlap != PARAM_OVERLAP_NONE)
+	{
+		pOverlap = parameterValueToFloat(PARAM_OVERLAP_IDX, gval.paramOverlap);
+	}
+	if (gval.paramOverlapCurve != PARAM_OVERLAPCURVE_NONE)
+	{
+		pOverlapCurve = parameterValueToInt(PARAM_OVERLAPCURVE_IDX, gval.paramOverlapCurve);
+	}
+
 	// Finally
+	if (gval.paramOverlap != PARAM_OVERLAP_NONE || gval.paramOverlapCurve != PARAM_OVERLAPCURVE_NONE || gval.paramBinSize != PARAM_BINSIZE_NONE)
+	{
+		overlapSize = GetOverlapSize();
+		if (overlapSize > 0)
+			CalculateOverlapFunction();
+	}
+
 	if (gval.paramBinSize != PARAM_BINSIZE_NONE)
 	{
 		ReallocBuffers();
@@ -361,9 +440,11 @@ void mi::Tick()
 
 	if (gval.paramBinSize != PARAM_BINSIZE_NONE || gval.paramWindowingFunction != PARAM_WINDOWFN_NONE || gval.paramAlpha != PARAM_ALPHA_NONE || gval.paramBeta != PARAM_BETA_NONE)
 	{
-		RecreateWindowFunction();
+		CalculateWindowFunction();
 	}
 }
+
+int debugT = 0;
 
 bool mi::MDKWorkStereo(float *psamples, int numsamples, const int mode)
 {
@@ -373,47 +454,132 @@ bool mi::MDKWorkStereo(float *psamples, int numsamples, const int mode)
 	// If input stops, reset fft buffer
 	if (mode == WM_WRITE)
 	{
-		inputOffset = 0;
+		// Maybe offsets should not be reset just because we get a mode != WM_READWRITE
+		ResetOffsets();
 	}
 
-	if (mode == WM_READWRITE || (mode == WM_WRITE && outputOffset >= 0))
+	float w, s;
+	char txt[64];
+
+	//if (debugfile && mode == 3)
+	//{
+	//	sprintf(txt, "W %d %.1f (D1 %d %d) (D2 %d %d)\n",  numsamples, pOverlap, data1CountDown, data1Offset, data2CountDown, data2Offset);
+	//	*debugfile << txt;
+	//}
+	if (mode == WM_READWRITE || (mode == WM_WRITE && (output1Offset >= 0 || output2Offset >= 0)))
 	{
 		for (int i = 0; i < numsamples; ++i)
 		{
 			if (mode == WM_READWRITE)
 			{
-				float w = window[inputOffset];
-				data[inputOffset] = w * 0.5*(psamples[i * 2] + psamples[(i * 2) + 1]) / 32768.f;
-				inputOffset++;
-				if (inputOffset == pBinSize)
+				debugT++;
+				if (data1CountDown == 0)
 				{
-					inputOffset = 0;
-
-					// forward fft
-					fft_fast(data);
-
-					Process(data);
-
-					// inverse fft
-					ifft_fast(data);
-
-					outputOffset = 0;
-
-					for (int j = 0; j < pBinSize; ++j)
+					w = window[data1Offset];
+					s = 0.5 * (psamples[i * 2] + psamples[(i * 2) + 1]);
+					data1[data1Offset] = w * s / 32768.f;
+					data1Offset++;
+					if (data1Offset == pBinSize)
 					{
-						output[j] = data[j].real() * 32768.f;
+						//if (debugfile) 
+						//{
+						//	sprintf(txt, "D1 %d %d\n", debugT - pBinSize, pBinSize);
+						//	*debugfile << txt;
+						//}
+
+						data1Offset = 0;
+						if (overlapSize > 0)
+						{
+							data1CountDown = GetNextCountDown();
+						}
+
+						// forward fft
+						fft_fast(data1);
+
+						// process data
+						Process(data1);
+
+						// inverse fft
+						ifft_fast(data1);
+
+						output1Offset = 0;
+
+						for (int j = 0; j < pBinSize; ++j)
+						{
+							w = 1.f - window[data1Offset];
+							output1[j] = data1[j].real() *32768.f;
+						}
+					}
+				}
+				else
+				{
+					data1CountDown--;
+				}
+
+				if (overlapSize > 0)
+				{
+					if (data2CountDown == 0)
+					{
+						w = window[data2Offset];
+						s = 0.5 * (psamples[i * 2] + psamples[(i * 2) + 1]);
+						data2[data2Offset] = w * s / 32768.f;
+						data2Offset++;
+						if (data2Offset == pBinSize)
+						{
+							//if (debugfile)
+							//{
+							//	sprintf(txt, "D2 %d %d\n", debugT - pBinSize, pBinSize);
+							//	*debugfile << txt;
+							//}
+
+							data2Offset = 0;
+							data2CountDown = GetNextCountDown();
+
+							// forward fft
+							fft_fast(data2);
+
+							// process data
+							Process(data2);
+
+							// inverse fft
+							ifft_fast(data2);
+
+							output2Offset = 0;
+
+							for (int j = 0; j < pBinSize; ++j)
+							{
+								output2[j] = data2[j].real() *32768.f;
+							}
+						}
+					}
+					else
+					{
+						data2CountDown--;
 					}
 				}
 			}
 
 			float k = 0.f;
+			bool merge = output1Offset >= 0 && output2Offset >= 0 && overlapSize > 0;
+			float kd = merge ? output2Offset < output1Offset ? (1.f - overlapCurve[output2Offset]) : overlapCurve[output1Offset] : 0.f;
 
-			if (outputOffset >= 0)
+			//sprintf(txt, "M %d %d %d %d\n",  overlapSize, output1Offset, output2Offset, merge);
+			//*debugfile << txt;
+
+			if (output1Offset >= 0)
 			{
-				k = output[outputOffset];
-				outputOffset++;
-				if (outputOffset == pBinSize) {
-					outputOffset = -1;
+				k += merge ? output1[output1Offset] * kd : output1[output1Offset];
+				output1Offset++;
+				if (output1Offset == pBinSize) {
+					output1Offset = -1;
+				}
+			}
+			if (output2Offset >= 0 && overlapSize > 0)
+			{
+				k += merge ? output2[output2Offset] * (1.f - kd) : output2[output2Offset];
+				output2Offset++;
+				if (output2Offset == pBinSize) {
+					output2Offset = -1;
 				}
 			}
 
@@ -489,13 +655,27 @@ char const *mi::DescribeValue(const int param, const int value)
 			sprintf(txt, "Sine"); break;
 		default:
 			return NULL;
-		}		
+		}
 		return txt;
 	case PARAM_ALPHA_IDX:
 		sprintf(txt, "%.3f", parameterValueToFloat(PARAM_ALPHA_IDX, value));
 		return txt;
 	case PARAM_BETA_IDX:
 		sprintf(txt, "%.3f", parameterValueToFloat(PARAM_BETA_IDX, value));
+		return txt;
+	case PARAM_OVERLAP_IDX:
+		sprintf(txt, value == 0 ? "none" : "%.1f %%", parameterValueToFloat(PARAM_OVERLAP_IDX, value));
+		return txt;
+	case PARAM_OVERLAPCURVE_IDX:
+		switch (value)
+		{
+		case OVERLAPCURVE_EXPONENTIAL:
+			sprintf(txt, "Exp"); break;
+		case OVERLAPCURVE_LINEAR:
+			sprintf(txt, "Linear"); break;
+		default:
+			return NULL;
+		}
 		return txt;
 	case PARAM_DEBUG_IDX:
 		return debug;
@@ -506,17 +686,57 @@ char const *mi::DescribeValue(const int param, const int value)
 
 void mi::ReallocBuffers()
 {
-	data = CArray(pBinSize);
-	inputOffset = 0;
+	data1 = CArray(pBinSize);
+	data2 = CArray(pBinSize);
+	
+	ResetOffsets();
 
-	output = FArray(pBinSize);
-	outputOffset = -1;
+	output1 = FArray(pBinSize);
+	output2 = FArray(pBinSize);
+	output1Offset = -1;
+	output2Offset = -1;
 }
 
-void mi::RecreateWindowFunction()
+void mi::CalculateWindowFunction()
 {
 	create_window_data(window, pBinSize, pWindowingFunction, pAlpha, pBeta, false);
-	inputOffset = 0;
+
+	ResetOffsets();
+}
+
+void mi::CalculateOverlapFunction()
+{
+	CreateOverlapData(overlapCurve, overlapSize, pOverlapCurve);
+
+	ResetOffsets();
+	output1Offset = -1;
+	output2Offset = -1;
+}
+
+void mi::ResetOffsets()
+{
+	data1Offset = 0;
+	data1CountDown = 0;
+	if (overlapSize > 0)
+	{
+		data2CountDown = GetFirstCountDown();
+		data2Offset = 0;
+	}
+}
+
+int mi::GetFirstCountDown()
+{
+	return pBinSize - (int)((pBinSize * pOverlap) / 100.f);
+}
+
+int mi::GetOverlapSize()
+{
+	return (int)((pBinSize * pOverlap) / 100.f);
+}
+
+int mi::GetNextCountDown()
+{
+	return pBinSize - 2*GetOverlapSize();
 }
 
 void mi::Process(CArray& x)
@@ -927,9 +1147,24 @@ void create_window_data(FArray& window, int length, int windowType, double alpha
 //The VonHann window is good for spectrogram displays because it spreads the value of a sharp peak(near integer frequencies) to the neighboring bins and reduces the leakage of in between frequencies, so when you do a tone sweep through the frequency range, the display remains somewhat consistent and less frame size dependent.Chances are that this same property will make it desirable for you to do the window function before you do your touching.
 //
 //Hope this helps,
-void overlap()
+void mi::CreateOverlapData(FArray& overlapCurve, int length, int overlapType)
 {
-
+	overlapCurve = FArray(length);
+	if (overlapType == 1)
+	{
+		// TBD
+		for (int j = 0; j < length; ++j)
+		{
+			overlapCurve[j] = ((float)j) / length;
+		}
+	}
+	else //if (overlapType == 0)
+	{
+		for (int j = 0; j < length; ++j)
+		{
+			overlapCurve[j] = ((float)j) / length;
+		}
+	}
 }
 
 
